@@ -1,115 +1,99 @@
 <?php
-// ================================================
-// api.php — REST-style handler untuk CRUD task
-// ================================================
-
 require_once 'config.php';
+requireLogin();
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
 
 $method = $_SERVER['REQUEST_METHOD'];
 $input  = json_decode(file_get_contents('php://input'), true) ?? [];
 $id     = isset($_GET['id']) ? (int)$_GET['id'] : null;
+$uid    = currentUser()['id'];
 $db     = getDB();
 
 try {
     switch ($method) {
 
-        // ── GET: ambil semua / satu task ──────────────────────────────
         case 'GET':
             if ($id) {
-                $stmt = $db->prepare('SELECT * FROM tasks WHERE id = ?');
-                $stmt->execute([$id]);
-                $task = $stmt->fetch();
-                echo json_encode($task ?: ['error' => 'Task tidak ditemukan']);
+                $s = $db->prepare('SELECT * FROM tasks WHERE id=? AND user_id=?');
+                $s->execute([$id, $uid]);
+                $t = $s->fetch();
+                echo json_encode($t ?: ['error' => 'Task tidak ditemukan']);
             } else {
-                $search    = $_GET['q']         ?? '';
-                $filterSt  = $_GET['status']    ?? '';
-                $filterPr  = $_GET['prioritas'] ?? '';
-                $sortBy    = in_array($_GET['sort'] ?? '', ['judul','deadline','prioritas','dibuat_pada'])
-                             ? $_GET['sort'] : 'dibuat_pada';
-                $sortDir   = ($_GET['dir'] ?? 'desc') === 'asc' ? 'ASC' : 'DESC';
+                $search  = $_GET['q']         ?? '';
+                $fStatus = $_GET['status']    ?? '';
+                $fPrio   = $_GET['prioritas'] ?? '';
+                $sort    = in_array($_GET['sort'] ?? '', ['judul','deadline','prioritas','dibuat_pada'])
+                           ? $_GET['sort'] : 'dibuat_pada';
+                $dir     = ($_GET['dir'] ?? 'desc') === 'asc' ? 'ASC' : 'DESC';
 
-                $where = ['1=1'];
-                $params = [];
+                $where  = ['user_id = ?'];
+                $params = [$uid];
 
-                if ($search) {
-                    $where[]  = '(judul LIKE ? OR deskripsi LIKE ?)';
-                    $params[] = "%$search%";
-                    $params[] = "%$search%";
-                }
-                if ($filterSt)  { $where[] = 'status = ?';    $params[] = $filterSt; }
-                if ($filterPr)  { $where[] = 'prioritas = ?'; $params[] = $filterPr; }
+                if ($search)  { $where[] = '(judul LIKE ? OR deskripsi LIKE ?)'; $params[] = "%$search%"; $params[] = "%$search%"; }
+                if ($fStatus) { $where[] = 'status = ?';    $params[] = $fStatus; }
+                if ($fPrio)   { $where[] = 'prioritas = ?'; $params[] = $fPrio; }
 
-                $sql  = 'SELECT * FROM tasks WHERE ' . implode(' AND ', $where)
-                      . " ORDER BY $sortBy $sortDir";
+                $sql  = 'SELECT * FROM tasks WHERE ' . implode(' AND ', $where) . " ORDER BY $sort $dir";
                 $stmt = $db->prepare($sql);
                 $stmt->execute($params);
-                $tasks = $stmt->fetchAll();
 
-                // ringkasan statistik
-                $statStmt = $db->query(
-                    "SELECT
-                        COUNT(*) AS total,
-                        SUM(status='selesai') AS selesai,
-                        SUM(status='proses')  AS proses,
-                        SUM(status='belum')   AS belum,
-                        SUM(prioritas='tinggi' AND status!='selesai') AS urgent
-                     FROM tasks"
+                $statS = $db->prepare(
+                    "SELECT COUNT(*) AS total,
+                            SUM(status='selesai') AS selesai,
+                            SUM(status='proses')  AS proses,
+                            SUM(status='belum')   AS belum,
+                            SUM(prioritas='tinggi' AND status!='selesai') AS urgent
+                     FROM tasks WHERE user_id=?"
                 );
-                echo json_encode(['tasks' => $tasks, 'stats' => $statStmt->fetch()]);
+                $statS->execute([$uid]);
+
+                echo json_encode(['tasks' => $stmt->fetchAll(), 'stats' => $statS->fetch()]);
             }
             break;
 
-        // ── POST: buat task baru ──────────────────────────────────────
         case 'POST':
-            if (empty($input['judul'])) {
-                http_response_code(400);
-                echo json_encode(['error' => 'Judul wajib diisi']);
-                break;
-            }
-            $stmt = $db->prepare(
-                'INSERT INTO tasks (judul, deskripsi, prioritas, status, deadline)
-                 VALUES (:judul, :deskripsi, :prioritas, :status, :deadline)'
-            );
-            $stmt->execute([
-                'judul'     => trim($input['judul']),
-                'deskripsi' => trim($input['deskripsi'] ?? ''),
-                'prioritas' => $input['prioritas'] ?? 'sedang',
-                'status'    => $input['status']    ?? 'belum',
-                'deadline'  => $input['deadline']  ?: null,
+            if (empty($input['judul'])) { http_response_code(400); echo json_encode(['error'=>'Judul wajib diisi']); break; }
+            $s = $db->prepare('INSERT INTO tasks (user_id,judul,deskripsi,prioritas,status,deadline) VALUES (?,?,?,?,?,?)');
+            $s->execute([
+                $uid,
+                trim($input['judul']),
+                trim($input['deskripsi'] ?? ''),
+                $input['prioritas'] ?? 'sedang',
+                $input['status']    ?? 'belum',
+                $input['deadline']  ?: null,
             ]);
-            $new = $db->prepare('SELECT * FROM tasks WHERE id = ?');
+            $new = $db->prepare('SELECT * FROM tasks WHERE id=?');
             $new->execute([$db->lastInsertId()]);
             http_response_code(201);
             echo json_encode(['success' => true, 'task' => $new->fetch()]);
             break;
 
-        // ── PUT: update task ──────────────────────────────────────────
         case 'PUT':
-            if (!$id) { http_response_code(400); echo json_encode(['error' => 'ID diperlukan']); break; }
-            $stmt = $db->prepare(
-                'UPDATE tasks SET judul=:judul, deskripsi=:deskripsi,
-                 prioritas=:prioritas, status=:status, deadline=:deadline
-                 WHERE id=:id'
+            if (!$id) { http_response_code(400); echo json_encode(['error'=>'ID diperlukan']); break; }
+            // Pastikan task milik user ini
+            $chk = $db->prepare('SELECT id FROM tasks WHERE id=? AND user_id=?');
+            $chk->execute([$id, $uid]);
+            if (!$chk->fetch()) { http_response_code(403); echo json_encode(['error'=>'Akses ditolak']); break; }
+
+            $s = $db->prepare(
+                'UPDATE tasks SET judul=?,deskripsi=?,prioritas=?,status=?,deadline=? WHERE id=? AND user_id=?'
             );
-            $stmt->execute([
-                'judul'     => trim($input['judul']),
-                'deskripsi' => trim($input['deskripsi'] ?? ''),
-                'prioritas' => $input['prioritas'] ?? 'sedang',
-                'status'    => $input['status']    ?? 'belum',
-                'deadline'  => $input['deadline']  ?: null,
-                'id'        => $id,
+            $s->execute([
+                trim($input['judul']),
+                trim($input['deskripsi'] ?? ''),
+                $input['prioritas'] ?? 'sedang',
+                $input['status']    ?? 'belum',
+                $input['deadline']  ?: null,
+                $id, $uid,
             ]);
             echo json_encode(['success' => true]);
             break;
 
-        // ── DELETE: hapus task ────────────────────────────────────────
         case 'DELETE':
-            if (!$id) { http_response_code(400); echo json_encode(['error' => 'ID diperlukan']); break; }
-            $stmt = $db->prepare('DELETE FROM tasks WHERE id = ?');
-            $stmt->execute([$id]);
+            if (!$id) { http_response_code(400); echo json_encode(['error'=>'ID diperlukan']); break; }
+            $s = $db->prepare('DELETE FROM tasks WHERE id=? AND user_id=?');
+            $s->execute([$id, $uid]);
             echo json_encode(['success' => true]);
             break;
 
@@ -119,5 +103,5 @@ try {
     }
 } catch (PDOException $e) {
     http_response_code(500);
-    echo json_encode(['error' => 'Database error: ' . $e->getMessage()]);
+    echo json_encode(['error' => 'DB error: ' . $e->getMessage()]);
 }
